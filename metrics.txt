@@ -1,0 +1,138 @@
+# >>> BEGIN EMPIRICAL TRADER METRICS (model-free) <<<
+# Assumes shapes: time x nT x nNS
+ns = ssr[0]['ns'] if isinstance(ssr, list) else outSSR['ns']
+Tgrid = outSSR['T'] if isinstance(outSSR, dict) and 'T' in outSSR else ssr[0]['Texp']
+
+# 1) ATM beta (λ̂) and R² per tenor (OLS of dσ ~ a + b·dlogF at NS≈0)
+atm = int(np.nanargmin(np.abs(ns)))
+beta_atm, r2_atm = [], []
+for ti in range(dvv_T.shape[1]):
+    x = dvlogF_T[:, ti, atm]
+    y = dvv_T[:,    ti, atm]
+    m = np.isfinite(x) & np.isfinite(y)
+    if m.sum() >= 8:
+        A = np.c_[np.ones(m.sum()), x[m]]
+        b, *_ = np.linalg.lstsq(A, y[m], rcond=None)
+        yhat = A @ b
+        beta_atm.append(b[1])
+        r2_atm.append(1 - np.var(y[m] - yhat) / (np.var(y[m]) + 1e-12))
+    else:
+        beta_atm.append(np.nan); r2_atm.append(np.nan)
+beta_atm = np.asarray(beta_atm); r2_atm = np.asarray(r2_atm)
+
+# 2) Correlation heatmap ρ(dlogF, dσ) across NS × tenor
+corr = np.full((dvv_T.shape[1], dvv_T.shape[2]), np.nan)
+for ti in range(dvv_T.shape[1]):
+    for xi in range(dvv_T.shape[2]):
+        x = dvlogF_T[:, ti, xi]; y = dvv_T[:, ti, xi]
+        m = np.isfinite(x) & np.isfinite(y)
+        if m.sum() >= 8:
+            corr[ti, xi] = np.corrcoef(x[m], y[m])[0, 1]
+
+# 3) Up/Down asymmetry of ATM slope
+lam_plus, lam_minus = [], []
+for ti in range(dvv_T.shape[1]):
+    x = dvlogF_T[:, ti, atm]; y = dvv_T[:, ti, atm]
+    m = np.isfinite(x) & np.isfinite(y)
+    xp, yp = x[m & (x > 0)], y[m & (x > 0)]
+    xn, yn = x[m & (x < 0)], y[m & (x < 0)]
+    lam_plus.append(np.polyfit(xp, yp, 1)[0] if xp.size >= 6 else np.nan)
+    lam_minus.append(np.polyfit(xn, yn, 1)[0] if xn.size >= 6 else np.nan)
+lam_plus, lam_minus = np.asarray(lam_plus), np.asarray(lam_minus)
+
+# 4) “Kink” x0(T): NS where the mean slope changes sign
+slope_mean = np.nanmedian(dvv_T / (dvlogF_T + 1e-12), axis=0)   # nT × nNS median slope
+x0 = np.full(slope_mean.shape[0], np.nan)
+for ti in range(slope_mean.shape[0]):
+    s = slope_mean[ti]
+    sgn = np.sign(s)
+    flip = np.where(np.diff(sgn) != 0)[0]
+    if flip.size:
+        j = flip[0]
+        x0[ti] = np.interp(0, [s[j], s[j+1]], [ns[j], ns[j+1]])
+
+# 5) Expected Δσ(NS,T) for a –1% spot move (turn slope into size)
+dlogF_1pct = np.log(0.99)
+beta_cell = np.nanmedian(dvv_T / (dvlogF_T + 1e-12), axis=0)    # nT × nNS
+exp_dv_m1 = beta_cell * dlogF_1pct
+
+# Pack into result payload so caller can plot without re-computing
+empirical = {
+    'Tgrid': np.asarray(Tgrid),
+    'ns': ns,
+    'beta_atm': beta_atm,
+    'r2_atm': r2_atm,
+    'lam_plus_atm': lam_plus,
+    'lam_minus_atm': lam_minus,
+    'x0': x0,
+    'corr': corr,                 # shape nT × nNS (rows=T, cols=NS)
+    'exp_dv_m1': exp_dv_m1,       # shape nT × nNS
+}
+# >>> END EMPIRICAL TRADER METRICS <<<
+
+
+
+# existing return payload …
+ret = {'T': T, 'lda': lda, 'lda2': lda2, 'figure': fig1}
+ret['empirical'] = empirical
+return ret
+
+
+
+ret = {'T': T, 'lda': lda, 'lda2': lda2, 'ssr_atm': None, 'sk_atm': None}
+ret['empirical'] = empirical
+return ret
+
+
+
+def plot_empirical_trader_views(empirical, title_prefix=""):
+    ns = empirical['ns']; Tgrid = empirical['Tgrid']
+    # 1) ATM beta and R²
+    fig_beta = go.Figure()
+    fig_beta.add_trace(go.Scatter(x=Tgrid, y=empirical['beta_atm'], mode='lines+markers', name='ATM beta (slope)'))
+    fig_beta.add_trace(go.Scatter(x=Tgrid, y=empirical['r2_atm'], mode='lines+markers', name='R²', yaxis='y2'))
+    fig_beta.update_layout(
+        title=f"{title_prefix} ATM beta & R² vs Tenor",
+        xaxis_title='Tenor (years)', yaxis_title='ATM beta (Δσ per ΔlogF)',
+        yaxis2=dict(overlaying='y', side='right', range=[0,1], title='R²')
+    )
+
+    # 2) Correlation heatmap
+    fig_corr = go.Figure(data=go.Heatmap(
+        z=empirical['corr'], x=ns, y=Tgrid, colorbar=dict(title='ρ(dlogF, dσ)')
+    ))
+    fig_corr.update_layout(title=f"{title_prefix} Corr heatmap (rows=T, cols=NS)", xaxis_title='NS', yaxis_title='Tenor')
+
+    # 3) Up/Down asymmetry at ATM
+    fig_asym = go.Figure()
+    fig_asym.add_trace(go.Scatter(x=Tgrid, y=empirical['lam_plus_atm'], mode='lines+markers', name='Up β (x>0)'))
+    fig_asym.add_trace(go.Scatter(x=Tgrid, y=empirical['lam_minus_atm'], mode='lines+markers', name='Down β (x<0)'))
+    fig_asym.update_layout(title=f"{title_prefix} Up/Down ATM beta", xaxis_title='Tenor', yaxis_title='β')
+
+    # 4) Kink x0(T)
+    fig_x0 = go.Figure()
+    fig_x0.add_trace(go.Scatter(x=Tgrid, y=empirical['x0'], mode='lines+markers', name='x₀'))
+    fig_x0.update_layout(title=f"{title_prefix} Kink location x₀(T)", xaxis_title='Tenor', yaxis_title='NS')
+
+    # 5) Expected Δσ for –1% move (heatmap)
+    fig_exp = go.Figure(data=go.Heatmap(
+        z=empirical['exp_dv_m1'], x=ns, y=Tgrid, colorbar=dict(title='Δσ for –1% spot')
+    ))
+    fig_exp.update_layout(title=f"{title_prefix} Expected Δσ map (–1% spot)", xaxis_title='NS', yaxis_title='Tenor')
+
+    return [fig_beta, fig_corr, fig_asym, fig_x0, fig_exp]
+
+
+
+
+res = generateVolDynamicAnalytics(outSSR, T=<pick>, plot=True, ...)
+# you plot SSR & ATM skew here
+
+
+
+
+
+emp = res['empirical']
+figs = plot_empirical_trader_views(emp, title_prefix=f"{TEST_NAME} {TEST_DATE}")
+for f in figs:
+    f.show()
