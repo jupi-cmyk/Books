@@ -1,0 +1,271 @@
+import numpy as np
+import pandas as pd
+
+# -------------------------------------------------------------
+# 1. EWMA covariance/variance estimation (per date)
+# -------------------------------------------------------------
+def ewma_cov_matrix(returns_df: pd.DataFrame, halflife: int = 63) -> pd.DataFrame:
+    """
+    Compute EWMA covariance matrix of all tickers for each date.
+
+    Parameters
+    ----------
+    returns_df : long DataFrame ['date', 'ticker', 'ret']
+    halflife : int
+        EWMA half-life in trading days.
+
+    Returns
+    -------
+    dict[date] -> (Sigma_t, sigma_vec_t)
+        Sigma_t : np.ndarray, N×N covariance matrix
+        sigma_vec_t : np.ndarray of vols (sqrt of diagonal)
+    """
+    lambda_ = np.exp(-np.log(2.0) / halflife)
+    one_minus = 1 - lambda_
+
+    tickers = sorted(returns_df["ticker"].unique())
+    N = len(tickers)
+    tick_idx = {t: i for i, t in enumerate(tickers)}
+
+    # Initialize covariance
+    Sigma_prev = np.zeros((N, N))
+    out = {}
+
+    for date, sub in returns_df.groupby("date"):
+        r_vec = np.zeros(N)
+        for _, row in sub.iterrows():
+            i = tick_idx[row["ticker"]]
+            r_vec[i] = row["ret"]
+
+        # Update recursion
+        Sigma_t = lambda_ * Sigma_prev + one_minus * np.outer(r_vec, r_vec)
+        sigma_vec = np.sqrt(np.diag(Sigma_t))
+        out[date] = (Sigma_t, sigma_vec)
+        Sigma_prev = Sigma_t
+
+    return out
+
+
+# -------------------------------------------------------------
+# 2. Ledoit–Wolf shrinkage toward constant-corr target
+# -------------------------------------------------------------
+def shrink_to_constant_corr(Sigma: np.ndarray, sigma: np.ndarray, delta: float = 0.2) -> np.ndarray:
+    """
+    Shrink covariance matrix toward constant-correlation target.
+
+    Parameters
+    ----------
+    Sigma : ndarray
+        Empirical covariance matrix.
+    sigma : ndarray
+        Vol vector (sqrt(diag(Sigma))).
+    delta : float
+        Shrinkage intensity (0=no shrinkage, 1=full constant corr).
+
+    Returns
+    -------
+    ndarray : shrunk covariance matrix.
+    """
+    N = len(sigma)
+    # Constant correlation implied by Sigma
+    offdiag = Sigma - np.diag(np.diag(Sigma))
+    denom = np.outer(sigma, sigma)
+    mask = denom > 0
+    rho_bar = np.sum(offdiag[mask]) / np.sum(denom[mask])
+    # Target
+    T = np.outer(sigma, sigma) * rho_bar
+    np.fill_diagonal(T, sigma**2)
+    return delta * T + (1 - delta) * Sigma
+
+
+# -------------------------------------------------------------
+# 3. Least-squares constant-correlation fit
+# -------------------------------------------------------------
+def ls_constant_corr(Sigma: np.ndarray, sigma: np.ndarray) -> float:
+    """
+    Estimate constant correlation rho by least squares.
+
+    rho = sum_{i<j} Sigma_ij sigma_i sigma_j / sum_{i<j} (sigma_i sigma_j)^2
+    """
+    N = len(sigma)
+    num, den = 0.0, 0.0
+    for i in range(N):
+        for j in range(i + 1, N):
+            num += Sigma[i, j] * sigma[i] * sigma[j]
+            den += (sigma[i] * sigma[j]) ** 2
+    return num / den if den > 0 else np.nan
+
+
+# -------------------------------------------------------------
+# 4. Wrapper: daily rho_t from returns DataFrame
+# -------------------------------------------------------------
+def ewma_shrunk_rho_time_series(
+    returns_df: pd.DataFrame,
+    halflife: int = 63,
+    shrink_delta: float = 0.2,
+) -> pd.DataFrame:
+    """
+    Compute time series of EWMA+shrunk constant-correlation estimate.
+
+    Parameters
+    ----------
+    returns_df : DataFrame ['date','ticker','ret']
+        Daily log returns.
+    halflife : int
+        EWMA half-life.
+    shrink_delta : float
+        Shrinkage weight toward constant-correlation target.
+
+    Returns
+    -------
+    DataFrame ['date','rho_hat']
+    """
+    cov_dict = ewma_cov_matrix(returns_df, halflife)
+    rho_series = []
+    for date, (Sigma_t, sigma_t) in cov_dict.items():
+        Sigma_shr = shrink_to_constant_corr(Sigma_t, sigma_t, delta=shrink_delta)
+        rho_t = ls_constant_corr(Sigma_shr, sigma_t)
+        rho_series.append((date, rho_t))
+    return pd.DataFrame(rho_series, columns=["date", "rho_hat"]).sort_values("date").reset_index(drop=True)
+
+
+# -------------------------------------------------------------
+# Example usage
+# -------------------------------------------------------------
+# Suppose you already have per-ticker daily log returns:
+#   all_returns = pd.concat([
+#       df.assign(ticker=ticker)
+#       for ticker, df in prices_dict.items()
+#   ])
+#   all_returns['ret'] = np.log(all_returns['adjusted_close']).groupby(all_returns['ticker']).diff()
+
+# Compute rho_t series
+# rho_df = ewma_shrunk_rho_time_series(all_returns[['date','ticker','ret']], halflife=63, shrink_delta=0.2)
+# print(rho_df.tail())
+
+
+
+
+
+
+import numpy as np
+import pandas as pd
+
+# ---------- 1) from your pipeline: get instantaneous rho_hat_t ----------
+# Assume you already built rho_df via ewma_shrunk_rho_time_series(...)
+# rho_df columns: ['date','rho_hat']
+
+def fisher_z_clip(rho, eps=1e-6):
+    rho = np.clip(rho, -1+eps, 1-eps)
+    return 0.5*np.log((1.0 + rho) / (1.0 - rho))
+
+def inv_fisher(z):
+    return np.tanh(z)
+
+# ---------- 2) Kalman filter + RTS smoother in Fisher-z space ----------
+def kalman_smooth_rho(
+    rho_df: pd.DataFrame,
+    phi: float = 0.98,          # state persistence
+    Q: float = None,            # state noise variance (in z-space)
+    R: float = None,            # obs noise variance (in z-space)
+    enforce_nonnegative: bool = False,  # if True, clip final rho >= 0
+    init_from_first: bool = True
+) -> pd.DataFrame:
+    """
+    Input:
+        rho_df: DataFrame with ['date','rho_hat'] (instantaneous estimate)
+    Output:
+        DataFrame with ['date','rho_obs','z_filt','z_smooth','rho_filt','rho_smooth']
+    """
+    df = rho_df.copy().sort_values('date').reset_index(drop=True)
+    y = fisher_z_clip(df['rho_hat'].values)
+
+    T = len(y)
+    if T == 0:
+        return pd.DataFrame(columns=['date','rho_obs','z_filt','z_smooth','rho_filt','rho_smooth'])
+
+    # Heuristic default variances if not supplied:
+    # Use robust dispersion of y to set R, and make Q smaller to enforce smoothing.
+    if R is None:
+        med = np.median(y)
+        mad = np.median(np.abs(y - med)) + 1e-12
+        R = (1.4826 * mad)**2  # robust variance proxy
+        R = max(R, 1e-6)
+    if Q is None:
+        # Set Q as a small fraction of R scaled by (1-phi)^2 so that steady-state variance is reasonable
+        Q = max(1e-8, 0.10 * R * (1 - phi)**2)
+
+    # Kalman filter (scalar obs, scalar state)
+    z_filt = np.zeros(T)
+    P_filt = np.zeros(T)
+
+    # Initialize
+    if init_from_first:
+        z0 = y[0]
+        P0 = R / max(1 - phi**2, 1e-6)   # steady-state-like init
+    else:
+        z0, P0 = 0.0, 10.0
+    z_pred, P_pred = z0, P0
+
+    mu = 0.0  # center (can set non-zero if you want a mean level in z-space)
+
+    for t in range(T):
+        # Measurement update
+        # y_t = z_t + eps, H=1
+        S = P_pred + R
+        K = P_pred / S
+        innov = y[t] - z_pred
+        z_upd = z_pred + K * innov
+        P_upd = (1 - K) * P_pred
+
+        z_filt[t] = z_upd
+        P_filt[t] = P_upd
+
+        # Time update to t+1: z = mu + phi (z - mu) + eta
+        z_pred = mu + phi * (z_upd - mu)
+        P_pred = phi**2 * P_upd + Q
+
+    # RTS smoother
+    z_smooth = np.zeros(T)
+    P_smooth = np.zeros(T)
+    z_smooth[-1] = z_filt[-1]
+    P_smooth[-1] = P_filt[-1]
+
+    z_pred_seq = np.zeros(T)
+    P_pred_seq = np.zeros(T)
+    # rebuild predicted seq for RTSS
+    z_pred_seq[0] = mu + phi*( (y[0] if init_from_first else 0.0) - mu )
+    P_pred_seq[0] = phi**2 * (P0 - P0**2/(P0+R)) + Q
+    for t in range(1, T):
+        z_pred_seq[t] = mu + phi*(z_filt[t-1] - mu)
+        P_pred_seq[t] = phi**2 * P_filt[t-1] + Q
+
+    for t in range(T-2, -1, -1):
+        C = P_filt[t] * phi / max(P_pred_seq[t+1], 1e-12)  # smoother gain
+        z_smooth[t] = z_filt[t] + C * (z_smooth[t+1] - z_pred_seq[t+1])
+        P_smooth[t] = P_filt[t] + C**2 * (P_smooth[t+1] - P_pred_seq[t+1])
+
+    # Back-transform
+    rho_obs   = df['rho_hat'].values
+    rho_filt  = inv_fisher(z_filt)
+    rho_smooth= inv_fisher(z_smooth)
+
+    if enforce_nonnegative:
+        rho_filt   = np.maximum(rho_filt, 0.0)
+        rho_smooth = np.maximum(rho_smooth, 0.0)
+
+    out = pd.DataFrame({
+        'date': df['date'],
+        'rho_obs': rho_obs,
+        'z_filt': z_filt,
+        'z_smooth': z_smooth,
+        'rho_filt': rho_filt,
+        'rho_smooth': rho_smooth
+    })
+    return out
+
+# ---------- 3) Typical usage ----------
+# rho_df = ewma_shrunk_rho_time_series(all_returns[['date','ticker','ret']], halflife=63, shrink_delta=0.2)
+# smoothed = kalman_smooth_rho(rho_df, phi=0.985, enforce_nonnegative=False)
+# Now use smoothed['rho_smooth'] as your realized-correlation estimate for the basket step.
+
