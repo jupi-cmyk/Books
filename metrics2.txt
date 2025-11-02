@@ -1,0 +1,15 @@
+suppose you have an index of stocks, whose price B_t at time t is calculated using the formula
+
+B_t = sum_{i in I_t} (P_t^i * S_t^i) / D_t
+
+Where I_t is the set of components in the the index at time t, P_t^i and S_t^i are the price and shares at time t of component i inside the index, and D_t is the divisor of the index. 
+
+Suppose that i only know these information (label today as T):
+today's divisor D_T
+today's index component set I_T
+today's shares S_T^i
+all past historical prices P_t^i for t<=T
+
+Now, i would like to reconstruct the past price history of the index, by using that formula, and keeping the shares fixed as of today. However, I have the following problem: we have the historical price of a component only after this component went public, therefore we need to adjust the divisor when a component's price is not available. Suppose a component S^j went public between time t-1 and t. this means that the divisor D_{t-1} has to be different from D_t, so that we do not have an artificla jump in the price of the index. 
+
+How can I solve this issue, i.e. how can i adjust the divisor in this case? Keep the explanation rigorous, clean and simple 
